@@ -18,7 +18,7 @@ BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 TEST_TEXT = "Hi How are you doing today? So happy to see you again."
 VOICE = "tara"
 NUM_RUNS = 5
-CONCURRENT_REQUESTS = 8
+CONCURRENT_REQUESTS = 12
 WARMUP_TEXT = "Doing warmup"
 OUTPUT_DIR = "outputs"
 

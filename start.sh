@@ -2,21 +2,9 @@
 set -e
 
 export HF_HOME="/workspace/hf"
-export HF_TOKEN="<your-token-here>"
-export TRANSFORMERS_OFFLINE=1
-export WORKERS=8
+# export HF_TOKEN="<your-token-here>"
+export TRANSFORMERS_OFFLINE=0 
 
-
-# uvicorn main_v2:app \
-# --host 0.0.0.0 \
-# --port 9090 \
-# --workers 1 \
-# --loop uvloop \
-# --http httptools \
-# --log-level warning \
-# --access-log \
-# --limit-concurrency 16 \
-# --limit-max-requests 1000
 
 vllm serve dst19/jess-voice-merged \
 --max-model-len 2048 \
@@ -24,11 +12,21 @@ vllm serve dst19/jess-voice-merged \
 --host 0.0.0.0 \
 --port 9191 \
 --max-num-batched-tokens 4096 \
---max-num-seqs 16 \
+--max-num-seqs 24 \
 --enable-chunked-prefill \
 --disable-log-requests \
 --block-size 16 \
---enable-prefix-caching
+--enable-prefix-caching &
+
+
+uvicorn main_v2:app \
+--host 0.0.0.0 \
+--port 9090 \
+--workers 12 \
+--loop uvloop \
+--http httptools \
+--log-level warning \
+--access-log
 
 # trtllm-serve serve dst19/jess-voice-merged \
 # --backend pytorch \

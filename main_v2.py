@@ -28,39 +28,28 @@ VOICE_DETAILS: List[VoiceDetail] = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initializes the VLLM serve client on application startup."""
+    """Initializes and closes resources for the application lifetime."""
     global vllm_client, VOICE_DETAILS
     
-    # Initialize VLLM serve client
-    try:
-        vllm_client = VLLMClient()
-    except KeyError as e:
-        logger.error(f"Missing required environment variable: {e}")
-        raise ValueError(f"Missing required environment variable: {e}")
-    except ValueError as e:
-        logger.error(f"Failed to initialize VLLM client: {e}")
-        raise
+    async with VLLMClient() as client:
+        vllm_client = client
+        
+        # Dynamically generate voice details from the loaded client
+        VOICE_DETAILS = [
+            VoiceDetail(
+                name=voice,
+                description=f"A standard {voice} voice.",
+                language="en",
+                gender="unknown",
+                accent="american"
+            ) for voice in vllm_client.available_voices
+        ]
+        
+        logger.info("Application startup complete. VLLM client is ready.")
+        yield 
     
-    # Dynamically generate voice details from the loaded client
-    VOICE_DETAILS = [
-        VoiceDetail(
-            name=voice,
-            description=f"A standard {voice} voice.",
-            language="en",
-            gender="unknown",
-            accent="american"
-        ) for voice in vllm_client.available_voices
-    ]
-    
-    logger.info(f"VLLM serve client initialized with server: {vllm_client.server_url}")
-    logger.info(f"Available voices: {vllm_client.available_voices}")
-    
-    yield
-    
-    # Clean up resources
-    if vllm_client:
-        await vllm_client.close()
-        logger.info("VLLM serve client closed")
+    logger.info("Application shutdown complete. VLLM client has been closed.")
+
 
 app = FastAPI(
     lifespan=lifespan,
@@ -104,6 +93,8 @@ async def tts_stream(data: TTSRequest):
 
     return StreamingResponse(generate_audio_stream(), media_type='audio/pcm')
 
+WS_MSG_DONE = orjson.dumps({"done": True})
+WS_MSG_EMPTY_INPUT = orjson.dumps({"type": "no_op", "reason": "empty_input"})
 
 @app.websocket("/v1/audio/speech/stream/ws")
 async def tts_stream_ws(websocket: WebSocket):
@@ -111,7 +102,6 @@ async def tts_stream_ws(websocket: WebSocket):
     logger.debug("WebSocket connection opened")
     try:
         while True:
-            # Use orjson for faster JSON parsing
             raw_data = await websocket.receive_text()
             data = orjson.loads(raw_data)
 
@@ -119,52 +109,56 @@ async def tts_stream_ws(websocket: WebSocket):
                 logger.debug("End of stream message received, closing connection.")
                 break
 
-            if not (input_text := data.get("input", "").strip()):
-                logger.debug("Empty or whitespace-only input received, skipping audio generation.")
+            input_text = data.get("input", "").strip()
+            if not input_text:
+                logger.debug("Empty or whitespace-only input received, sending no_op.")
+                await websocket.send_text(WS_MSG_EMPTY_INPUT.decode('utf-8'))
                 continue
 
             voice = data.get("voice", "tara")
             segment_id = data.get("segment_id", "no_segment_id")
-
+            
+            start_msg = orjson.dumps({"type": "start", "segment_id": segment_id})
+            end_msg = orjson.dumps({"type": "end", "segment_id": segment_id})
             start_time = time.perf_counter()
+
             try:
-                await websocket.send_text(orjson.dumps({"type": "start", "segment_id": segment_id}).decode('utf-8'))
+                await websocket.send_text(start_msg.decode('utf-8'))
 
-                if input_text:
-                    logger.info(f"Generating audio for input: '{input_text}' with voice: {voice}")
-                    
-                    # Generate tokens using vllm_client
-                    token_generator = vllm_client.generate_tokens(
-                        prompt=input_text,
-                        voice=voice,
-                    )
-                    
-                    # Decode tokens to audio
-                    audio_generator = tokens_decoder(token_generator)
-
-                    first_chunk = True
-                    async for chunk in audio_generator:
-                        if first_chunk:
-                            ttfb = time.perf_counter() - start_time
-                            logger.info(f"Time to first audio chunk (TTFB): {ttfb*1000:.2f} ms")
-                            first_chunk = False
-                        await websocket.send_bytes(chunk)
-                else:
-                    logger.debug("Empty or whitespace-only input received, skipping audio generation.")
+                logger.info(f"Generating audio for input: '{input_text}' with voice: {voice}")
                 
-                await websocket.send_text(orjson.dumps({"type": "end", "segment_id": segment_id}).decode('utf-8'))
+                # Generate tokens using vllm_client
+                token_generator = vllm_client.generate_tokens(
+                    prompt=input_text,
+                    voice=voice,
+                )
+                
+                # Decode tokens to audio
+                audio_generator = tokens_decoder(token_generator)
+
+                first_chunk = True
+                async for chunk in audio_generator:
+                    if first_chunk:
+                        ttfb = time.perf_counter() - start_time
+                        logger.info(f"Time to first audio chunk (TTFB): {ttfb*1000:.2f} ms")
+                        first_chunk = False
+                    await websocket.send_bytes(chunk)
+                
+                await websocket.send_text(end_msg.decode('utf-8'))
 
                 if not data.get("continue", True):
                     await websocket.send_text(orjson.dumps({"done": True}).decode('utf-8'))
                     break
 
             except asyncio.TimeoutError:
-                logger.error("Request timed out during audio generation in websocket")
-                await websocket.send_text(orjson.dumps({"error": "Request timed out", "done": True}).decode('utf-8'))
+                error_msg = orjson.dumps({"error": "Request timed out", "done": True, "segment_id": segment_id})
+                logger.error(f"Request timed out for segment '{segment_id}'")
+                await websocket.send_text(error_msg.decode('utf-8'))
                 break
             except Exception as e:
-                logger.exception(f"An error occurred during audio generation in websocket: {e}")
-                await websocket.send_text(orjson.dumps({"error": str(e), "done": True}).decode('utf-8'))
+                error_msg = orjson.dumps({"error": str(e), "done": True, "segment_id": segment_id})
+                logger.exception(f"An error occurred for segment '{segment_id}': {e}")
+                await websocket.send_text(error_msg.decode('utf-8'))
                 break
 
     except WebSocketDisconnect:

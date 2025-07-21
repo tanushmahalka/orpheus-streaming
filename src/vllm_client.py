@@ -3,7 +3,7 @@ import asyncio
 import orjson
 import logging
 import os
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,136 +13,97 @@ logger = logging.getLogger(__name__)
 class VLLMClient:
     """Client for making requests to VLLM serve server."""
     
-    def __init__(self, server_url: str = None):
-        """Initialize the VLLM serve client"""
+    def __init__(self):
+        """Initializes the VLLM client"""
         try:
-            # Load all environment variables
-            self.server_url = server_url or os.environ["SERVE_URL"]
+            self.server_url = f"{os.environ['SERVE_URL']}/completions"
             self.model_name = os.environ["MODEL_NAME"]
-            self.api_key = os.environ["API_KEY"]
-            voices_str = os.environ["AVAILABLE_VOICES"]
             
-            # Parse and set values
-            self.available_voices = [voice.strip() for voice in voices_str.split(',')]
-            self.connect_timeout = float(os.environ["CONNECT_TIMEOUT"])
-            self.read_timeout = float(os.environ["READ_TIMEOUT"])
-            self.total_timeout = float(os.environ["TOTAL_TIMEOUT"])
-            self.max_connections = int(os.environ["MAX_CONNECTIONS"])
-            self.max_connections_per_host = int(os.environ["MAX_CONNECTIONS_PER_HOST"])
-            max_concurrent_requests = int(os.environ["MAX_CONCURRENT_REQUESTS"])
+            max_conns_per_worker = int(os.environ["MAX_CONNS_PER_WORKER"])
+            self.timeout = aiohttp.ClientTimeout(
+                total=float(os.environ["TOTAL_TIMEOUT"]),
+                connect=float(os.environ["CONNECT_TIMEOUT"]),
+                sock_read=float(os.environ["READ_TIMEOUT"])
+            )
+
+            api_key = os.environ["API_KEY"]
+            self.available_voices = [v.strip() for v in os.environ["AVAILABLE_VOICES"].split(',')]
             
-            # Store sampling parameters for later use
-            self.stop_token_ids = [int(token.strip()) for token in os.environ["STOP_TOKEN_IDS"].split(',')]
-            self.max_tokens = int(os.environ["MAX_TOKENS"])
-            self.temperature = float(os.environ["TEMPERATURE"])
-            self.top_p = float(os.environ["TOP_P"])
-            self.repetition_penalty = float(os.environ["REPETITION_PENALTY"])
+            self.sampling_params = {
+                "max_tokens": int(os.environ["MAX_TOKENS"]),
+                "temperature": float(os.environ["TEMPERATURE"]),
+                "top_p": float(os.environ["TOP_P"]),
+                "repetition_penalty": float(os.environ["REPETITION_PENALTY"]),
+                "stop_token_ids": [int(t.strip()) for t in os.environ["STOP_TOKEN_IDS"].split(',')]
+            }
+            
             self.max_retries = int(os.environ["MAX_RETRIES"])
             self.retry_delay = float(os.environ["RETRY_DELAY"])
-            
-            # Session for connection pooling
-            self._session = None
-            self._semaphore = asyncio.Semaphore(max_concurrent_requests)
-            
+
         except KeyError as e:
-            raise ValueError(f"Missing required environment variable: {e}")
-        except ValueError as e:
-            raise ValueError(f"Invalid environment variable value: {e}")
-        
-        logger.info(f"VLLMClient initialized with server: {self.server_url}")
-        logger.info(f"Model: {self.model_name}")
-        logger.info(f"Available voices: {self.available_voices}")
-        logger.info(f"Timeouts - Connect: {self.connect_timeout}s, Read: {self.read_timeout}s, Total: {self.total_timeout}s")
-        logger.info(f"Max concurrent requests: {max_concurrent_requests}")
-    
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create an aiohttp session with proper configuration."""
+            logger.error(f"Missing a critical environment variable: {e}")
+            raise ValueError(f"Missing a critical environment variable: {e}") from e
+
+        # Session and Connector
+        self._connector = aiohttp.TCPConnector(
+            limit_per_host=max_conns_per_worker,
+            force_close=False,               
+            enable_cleanup_closed=False,        
+            ssl=False                           
+        )
+        self._headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream"
+        }
+        self._session: aiohttp.ClientSession = None
+        logger.info(f"VLLMClient initialized for server: {self.server_url}")
+
+    async def __aenter__(self):
+        """Creates the aiohttp session when entering the async context."""
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(
-                connect=self.connect_timeout,
-                sock_read=self.read_timeout,
-                total=self.total_timeout
-            )
-            
-            connector = aiohttp.TCPConnector(
-                limit=self.max_connections,
-                limit_per_host=self.max_connections_per_host,
-                keepalive_timeout=120,
-                enable_cleanup_closed=True,
-                ttl_dns_cache=600,
-                use_dns_cache=True,
-                force_close=False
-            )
-            
             self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Accept": "text/event-stream"
-                }
+                timeout=self.timeout,
+                connector=self._connector,
+                headers=self._headers,
+                json_serialize=lambda obj: orjson.dumps(obj).decode('utf-8')
             )
-        
-        return self._session
-    
-    async def close(self):
-        """Close the aiohttp session."""
+        logger.info("VLLMClient session started.")
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Closes the aiohttp session when exiting the async context."""
         if self._session and not self._session.closed:
             await self._session.close()
+            logger.info("VLLMClient session closed.")
     
-    def _format_prompt(self, prompt: str, voice: str = "tara") -> str:
-        """Format the prompt for the VLLM serve API."""
+    def _format_prompt(self, prompt: str, voice: str) -> str:
+        """Formats the prompt for the VLLM API."""
         adapted_prompt = f"{voice}: {prompt}"
         return f"<custom_token_3><|begin_of_text|>{adapted_prompt}<|eot_id|><custom_token_4><custom_token_5><custom_token_1>"
     
-    async def generate_tokens(self, prompt: str, voice: str = "tara") -> AsyncGenerator[str, None]:
-        """Generate tokens asynchronously from the VLLM serve server.
-        
-        Args:
-            prompt: The text prompt to generate tokens for
-            voice: The voice to use for generation
-            
-        Yields:
-            Generated token strings
+    async def generate_tokens(self, prompt: str, voice: str) -> AsyncGenerator[str, None]:
+        """
+        Generates tokens asynchronously from the VLLM server with connection pooling and retries.
         """
         if voice not in self.available_voices:
             raise ValueError(f"Voice '{voice}' is not available. Available voices: {self.available_voices}")
         
         formatted_prompt = self._format_prompt(prompt, voice)
-                
         payload = {
             "model": self.model_name,
             "prompt": formatted_prompt,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "repetition_penalty": self.repetition_penalty,
-            "stream": True,  # Always stream for better performance
-            "stop_token_ids": self.stop_token_ids
+            "stream": True,
+            **self.sampling_params
         }
-        
+                
         for attempt in range(self.max_retries + 1):
             try:
-                # Use semaphore to limit concurrent requests
-                async with self._semaphore:
-                    session = await self._get_session()
-
-                logger.info(f"Sending request to {self.server_url}/completions")
-                
-                # Use regular aiohttp with improved SSE parsing
-                async with session.post(
-                    f"{self.server_url}/completions",
-                    json=payload,
-                    headers={"Accept": "text/event-stream"}
-                ) as response:
+                # Use the persistent session to make the request
+                async with self._session.post(self.server_url, json=payload, timeout=self.timeout) as response:
+                    response.raise_for_status()
                     
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"VLLM serve API error: {response.status} - {error_text}")
-                        raise Exception(f"VLLM serve API error: {response.status} - {error_text}")
-                    
-                    # Process the streaming response with improved parsing
+                    # Process the streaming response
                     buffer = ""
                     async for line in response.content:
                         if line:
@@ -158,46 +119,21 @@ class VLLMClient:
                                     data_str = line[6:]
                                     
                                     if data_str.strip() == '[DONE]':
-                                        return
+                                        return # Successful completion
                                     
                                     try:
                                         data = orjson.loads(data_str)
-                                        if 'choices' in data and len(data['choices']) > 0:
-                                            token_text = data['choices'][0].get('text', '')
-                                            if token_text:
-                                                yield token_text
-                                    except orjson.JSONDecodeError as e:
-                                        logger.warning(f"Failed to parse JSON from stream: {e}")
-                    
-                    # If we get here, the request was successful
-                    break
-                                        
-            except asyncio.TimeoutError:
-                logger.error(f"Request to VLLM serve timed out (attempt {attempt + 1}/{self.max_retries + 1})")
+                                        if (choices := data.get('choices')) and choices[0].get('text'):
+                                            yield choices[0]['text']
+                                    except (orjson.JSONDecodeError, IndexError, KeyError):
+                                        logger.warning(f"Could not parse chunk: {data_str}")
+                                        continue
+                return # Exit loop on success
+            
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(f"Request to VLLM failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
                 if attempt < self.max_retries:
-                    logger.info(f"Retrying request after timeout (attempt {attempt + 1}/{self.max_retries + 1})")
-                    await asyncio.sleep(self.retry_delay)
+                    await asyncio.sleep(self.retry_delay * (attempt + 1)) # Exponential backoff
                 else:
-                    raise Exception("Request to VLLM serve timed out after all retries")
-            except aiohttp.ClientError as e:
-                logger.error(f"HTTP client error (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying request after HTTP error (attempt {attempt + 1}/{self.max_retries + 1})")
-                    await asyncio.sleep(self.retry_delay)
-                else:
-                    raise Exception(f"HTTP client error after all retries: {e}")
-            except Exception as e:
-                logger.error(f"Unexpected error in generate_tokens (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
-                if attempt < self.max_retries:
-                    logger.info(f"Retrying request after unexpected error (attempt {attempt + 1}/{self.max_retries + 1})")
-                    await asyncio.sleep(self.retry_delay)
-                else:
-                    raise
-    
-    async def __aenter__(self):
-        """Async context manager entry."""
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        await self.close() 
+                    logger.error("VLLM request failed after all retries.")
+                    raise Exception("Failed to get response from VLLM server.") from e
