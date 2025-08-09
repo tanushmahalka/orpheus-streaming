@@ -6,9 +6,9 @@ export HF_HOME="/workspace/hf"
 export TRANSFORMERS_OFFLINE=0 
 
 
-vllm serve dst19/jess-voice-merged \
+CUDA_VISIBLE_DEVICES=0 vllm serve dst19/jess-voice-merged \
 --max-model-len 2048 \
---gpu-memory-utilization 0.6 \
+--gpu-memory-utilization 0.3 \
 --host 0.0.0.0 \
 --port 9191 \
 --max-num-batched-tokens 4096 \
@@ -19,10 +19,10 @@ vllm serve dst19/jess-voice-merged \
 --enable-prefix-caching &
 
 
-uvicorn main_v2:app \
+CUDA_VISIBLE_DEVICES=1 uvicorn main_v2:app \
 --host 0.0.0.0 \
 --port 9090 \
---workers 12 \
+--workers 24 \
 --loop uvloop \
 --http httptools \
 --log-level warning \
