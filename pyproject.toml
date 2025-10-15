@@ -1,0 +1,26 @@
+[project]
+name = "orpheus-streaming"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "=3.12"
+dependencies = [
+    "cerebrium>=1.50.0",
+    "fastapi>=0.119.0",
+    "httptools>=0.7.1",
+    "orjson>=3.11.3",
+    "pydantic>=2.12.2",
+    "python-dotenv>=1.1.1",
+    "setuptools>=80.9.0",
+    "snac>=1.2.1",
+    "tqdm>=4.67.1",
+    "uvicorn[standard]>=0.37.0",
+    "torch>=2.9.0",
+    "transformers"
+]
+
+
+[[tool.uv.index]]
+name = "tensorrt_llm"
+url = "https://pypi.nvidia.com"
+explicit = true

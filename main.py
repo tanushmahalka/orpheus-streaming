@@ -24,6 +24,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+def healthcheck(message: str): 
+    print('Running healthcheck')
+    return {'result': message}
 
 class TTSRequest(BaseModel):
     input: str = "Hey there, looks like you forgot to provide a prompt!"
